@@ -1,5 +1,5 @@
-;; Decentralized Fact Verification Protocol - Stage 2
-;; An enhanced blockchain-based system for verifying news facts with journalist reputation tracking
+;; Decentralized Fact Verification and Journalism Protocol
+;; A blockchain-based system for verifying news facts, maintaining journalistic integrity, and rewarding accurate reporting
 
 ;; Constants
 (define-constant ERR-NOT-PROTOCOL-EDITOR (err u1))
@@ -19,15 +19,15 @@
 (define-data-var current-cycle uint u0)
 (define-data-var credibility-threshold uint u1000000) ;; 1 STX
 (define-data-var total-bounty-pool uint u0)
-(define-data-var latest-ledger-block uint u0)
+(define-data-var latest-ledger-block uint u0) ;; Block height tracking for verification periods
 
 ;; Claim Structure
 (define-map news-claims
     uint
     {
         headline: (string-utf8 256),
-        truth-hash: (buff 32),      
-        verification-time: uint,    
+        truth-hash: (buff 32),      ;; SHA256 hash of the verified factual evidence
+        verification-time: uint,    ;; Verification deadline (block height)
         bounty: uint,
         verified: bool
     }
@@ -38,7 +38,7 @@
     principal
     {
         active-claim: uint,
-        verified-claims: (list 10 uint),
+        verified-claims: (list 20 uint),
         last-verification: uint,
         total-verified: uint
     }
@@ -53,6 +53,12 @@
     }
 )
 
+;; Events
+(define-map verification-history
+    uint
+    (list 10 {journalist: principal, verified-block: uint})
+)
+
 ;; Authorization
 (define-private (is-editor)
     (is-eq tx-sender (var-get protocol-editor)))
@@ -61,6 +67,7 @@
 (define-public (update-ledger-block (new-block uint))
     (begin
         (asserts! (is-editor) ERR-NOT-PROTOCOL-EDITOR)
+        ;; Validate block is not less than current
         (asserts! (>= new-block (var-get latest-ledger-block)) ERR-INVALID-PARAMETER)
         (var-set latest-ledger-block new-block)
         (ok true)))
@@ -92,6 +99,12 @@
         ;; Validate verification time is in the future
         (asserts! (>= verification-time (var-get latest-ledger-block)) ERR-INVALID-PARAMETER)
         
+        ;; Validate truth hash is not empty
+        (asserts! (> (len truth-hash) u0) ERR-INVALID-PARAMETER)
+        
+        ;; Validate headline is not empty
+        (asserts! (> (len headline) u0) ERR-INVALID-PARAMETER)
+        
         ;; Validate bounty is a positive amount
         (asserts! (> bounty u0) ERR-INVALID-PARAMETER)
         
@@ -107,7 +120,9 @@
             
         ;; Calculate new bounty pool safely
         (let ((new-pool (+ (var-get total-bounty-pool) bounty)))
+            ;; Make sure the addition doesn't overflow
             (asserts! (>= new-pool (var-get total-bounty-pool)) ERR-INVALID-PARAMETER)
+            ;; Update the total bounty pool
             (var-set total-bounty-pool new-pool))
         (ok true)))
 
@@ -141,7 +156,7 @@
         (asserts! (>= current-block (get verification-time claim)) ERR-VERIFICATION-PERIOD-ACTIVE)
         (asserts! (not (get verified claim)) ERR-CLAIM-ALREADY-VERIFIED)
         
-        ;; Verify evidence proof
+        ;; Verify evidence proof - directly compare the hashes
         (if (is-eq evidence-proof (get truth-hash claim))
             (begin
                 ;; Update claim status
@@ -151,10 +166,10 @@
                 ;; Update journalist record
                 (map-set journalist-records tx-sender
                     (merge journalist {
-                        active-claim: claim-id,
+                        active-claim: (+ claim-id u1),
                         verified-claims: (unwrap! (as-max-len? 
-                            (append (get verified-claims journalist) claim-id) u10)
-                            ERR-INVALID-PARAMETER),
+                            (append (get verified-claims journalist) claim-id) u20)
+                            ERR-INVALID-CLAIM),
                         last-verification: current-block,
                         total-verified: (+ (get total-verified journalist) u1)
                     }))
@@ -170,6 +185,16 @@
                 ;; Distribute bounty
                 (try! (stx-transfer? (get bounty claim) (var-get protocol-editor) tx-sender))
                 
+                ;; Record verification history
+                (match (map-get? verification-history claim-id)
+                    history (map-set verification-history claim-id
+                        (unwrap! (as-max-len?
+                            (append history {journalist: tx-sender, verified-block: current-block})
+                            u10)
+                            ERR-INVALID-CLAIM))
+                    (map-set verification-history claim-id
+                        (list {journalist: tx-sender, verified-block: current-block})))
+                
                 (ok true))
             ERR-INCORRECT-VERIFICATION-PROOF)))
 
@@ -184,8 +209,8 @@
 (define-read-only (get-journalist-profile (journalist principal))
     (map-get? journalist-records journalist))
 
-(define-read-only (get-verification-history (claim-id uint, journalist principal))
-    (map-get? claim-verifications {claim-id: claim-id, journalist: journalist}))
+(define-read-only (get-verification-history (claim-id uint))
+    (map-get? verification-history claim-id))
 
 (define-read-only (get-current-block)
     (var-get latest-ledger-block))
@@ -194,7 +219,7 @@
     {
         active: (var-get protocol-status),
         current-cycle: (var-get current-cycle),
-        total-bounty-pool: (var-get total-bounty-pool), 
+        total-bounty-pool: (var-get total-bounty-pool),
         credibility-threshold: (var-get credibility-threshold),
         latest-ledger-block: (var-get latest-ledger-block)
     })
@@ -209,4 +234,17 @@
     (begin
         (asserts! (is-editor) ERR-NOT-PROTOCOL-EDITOR)
         (var-set protocol-status false)
+        (ok true)))
+
+(define-public (advance-cycle)
+    (begin
+        (asserts! (is-editor) ERR-NOT-PROTOCOL-EDITOR)
+        (asserts! (var-get protocol-status) ERR-PROTOCOL-SUSPENDED)
+        (var-set current-cycle (+ (var-get current-cycle) u1))
+        (ok true)))
+
+(define-public (transfer-protocol-editor (new-editor principal))
+    (begin
+        (asserts! (is-editor) ERR-NOT-PROTOCOL-EDITOR)
+        (var-set protocol-editor new-editor)
         (ok true)))
